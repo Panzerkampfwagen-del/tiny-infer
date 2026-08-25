@@ -1,7 +1,7 @@
 /*
  * test_infer -- assert-based correctness tests for the tiny_infer kernels.
- * Every kernel is validated against a trivially-correct reference, mirroring
- * the original repo's "validate against reference" discipline.
+ * Every kernel is validated against a trivially-correct reference before
+ * any benchmark output is trusted: the validate-first discipline.
  */
 #include "../include/tensor.hpp"
 
@@ -138,8 +138,8 @@ static void test_model_and_io(void)
     for (size_t i = 0; i < X.numel(); i++) X[i] = d(rng);
 
     Tensor L1 = m.forward(X);
-    m.save("/tmp/opencode/mlp.bin");
-    MLP m2 = MLP::load("/tmp/opencode/mlp.bin");
+    m.save("mlp_roundtrip.bin");
+    MLP m2 = MLP::load("mlp_roundtrip.bin");
     Tensor L2 = m2.forward(X);
 
     CHECK(m.d_model == m2.d_model && m.vocab == m2.vocab &&
@@ -161,7 +161,7 @@ static void test_model_and_io(void)
     // corrupt/truncated files are rejected with an exception, not UB
     bool threw = false;
     try {
-        const char* p = "/tmp/opencode/mlp_truncated.bin";
+        const char* p = "mlp_truncated.bin";
         FILE* fp = fopen(p, "wb");
         fwrite("TIIN", 4, 1, fp);          // header only -- no tensors
         fclose(fp);
@@ -170,7 +170,7 @@ static void test_model_and_io(void)
         threw = true;
     }
     CHECK(threw, "truncated model file throws instead of crashing");
-    remove("/tmp/opencode/mlp_truncated.bin");
+    remove("mlp_truncated.bin");
 }
 
 int main(void)
