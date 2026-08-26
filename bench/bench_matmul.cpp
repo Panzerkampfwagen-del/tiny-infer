@@ -63,5 +63,37 @@ int main(void)
     double dt = now_ms() - t0;
     printf("MLP d=512 h=2048 vocab=1000 batch=64: %.3f ms/forward (%.0f fwd/s)\n",
            dt / reps, reps * 1000.0 / dt);
+
+    // int8 weight-only quantized linear vs fp32 Linear, same shapes
+    {
+        const uint32_t OUT = 2048, IN = 512;
+        Linear L; L.W = Tensor({OUT, IN}); L.b = Tensor({OUT});
+        for (size_t i = 0; i < L.W.numel(); i++) L.W[i] = dist(rng);
+        for (size_t i = 0; i < L.b.numel(); i++) L.b[i] = dist(rng);
+        Tensor Xi({64, IN});
+        for (size_t i = 0; i < Xi.numel(); i++) Xi[i] = dist(rng);
+
+        QLinearInt8 q = QLinearInt8::from_linear(L);
+        const double flops = (double)64 * OUT * IN * 2.0;
+
+        t0 = now_ms();
+        volatile float s1 = 0;
+        for (int r = 0; r < reps; r++) { Tensor Yf = L.forward(Xi); s1 += Yf[0]; }
+        double t_fp = now_ms() - t0;
+
+        t0 = now_ms();
+        volatile float s2 = 0;
+        for (int r = 0; r < reps; r++) { Tensor Yq = q.forward(Xi); s2 += Yq[0]; }
+        double t_q = now_ms() - t0;
+
+        double num = 0, den = 0;
+        { Tensor Yf = L.forward(Xi), Yq = q.forward(Xi);
+          for (size_t i = 0; i < Yf.numel(); i++) {
+              double d = Yq[i] - Yf[i]; num += d * d; den += (double)Yf[i] * Yf[i]; } }
+        printf("int8-linear out=%u in=%u batch=64: fp32 %.1f GFLOP/s | int8-w-only %.1f GFLOP/s | weights %zu KB vs %zu KB | rel RMS err %.4f\n",
+               OUT, IN, reps * flops / (t_fp * 1e6), reps * flops / (t_q * 1e6),
+               q.weight_bytes() / 1024, L.W.numel() * 4 / 1024,
+               (float)std::sqrt(num / den));
+    }
     return 0;
 }

@@ -11,16 +11,18 @@ doesn't.
 ```
 include/tensor.hpp     Tensor struct + kernel/model API
 src/tensor.cpp         naive & register-blocked OpenMP matmul, relu/gelu,
-                       stable softmax, RMSNorm, Linear, fused bias+relu,
+                       stable softmax, RMSNorm, SwiGLU, Linear, fused
+                       bias+relu, RoPE, causal SDPA attention + KV cache,
+                       per-row INT8 quantized linear, seeded sampler,
                        MLP, flat-binary serialization
-tests/test_infer.cpp   correctness suite (16 checks)
-bench/bench_matmul.cpp GFLOP/s table + model throughput
+tests/test_infer.cpp   correctness suite (37 checks)
+bench/bench_matmul.cpp GFLOP/s table + model throughput + int8 comparison
 ```
 
 ## Build & run
 
 ```sh
-make test     # correctness suite (16 checks)
+make test     # correctness suite (37 checks)
 make bench    # GFLOP/s: naive vs tiled+parallel; MLP fwd/s
 make clean
 ```
@@ -46,6 +48,20 @@ Requires g++ ≥ 12 with OpenMP. Nothing else.
   evaluates to exactly 0.0 (asserted by tolerance, not sign).
 - **`linear_bias_relu`** — bias folded into the dot-product accumulator,
   ReLU applied in the same pass over outputs: one pass total.
+- **`rope`** — rotary position embedding, HF/NeoX `rotate_half` convention:
+  pairwise rotation is norm-preserving (asserted), position 0 is identity.
+- **`sdpa`** — multi-head scaled dot-product attention over `(T,H,Dh)`
+  tensors with optional causal masking; validated against a reference AND
+  by a perturbation property test (row i's output is bit-identical when
+  only *future* keys change).
+- **`KVCache`** — fixed-capacity per-layer K/V buffer; decode steps through
+  the cache are checked to equal full recomputation over the whole history.
+- **`swiglu`** — `silu(gate) * up`, the LLaMA feed-forward activation.
+- **`QLinearInt8`** — per-output-row symmetric INT8 weight quantization with
+  FP32 scales; activations stay FP32 and weights dequantize on the fly
+  (~2x smaller weights, small measured accuracy cost — see `make bench`).
+- **`Sampler`** — greedy / temperature / top-k / top-p (nucleus) over one
+  logits row; identically configured samplers replay identical sequences.
 
 ## Weight serialization
 

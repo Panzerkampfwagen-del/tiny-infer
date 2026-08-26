@@ -322,4 +322,255 @@ MLP MLP::load(const char* path)
     return m;
 }
 
+
+/* ---- transformer primitives ---------------------------------------------*/
+
+// Rotary position embedding, HF/NeoX rotate_half convention:
+//   out[:D/2]  = x[:D/2]*cos(t) - x[D/2:]*sin(t)
+//   out[D/2:]  = x[D/2:]*cos(t) + x[:D/2]*sin(t)
+// with theta_j = pos * base^(-2j/D). X is (T, H*D), row-major per token.
+Tensor rope(const Tensor& X, uint32_t n_heads, uint32_t pos_offset, float base)
+{
+    const uint32_t T = X.rows();
+    const uint32_t D = X.cols() / n_heads;      // head dim
+    const uint32_t half = D / 2;
+    Tensor Y = X;
+
+    // precompute inverse frequencies once
+    std::vector<float> inv_freq(half);
+    for (uint32_t j = 0; j < half; j++)
+        inv_freq[j] = std::pow(base, -2.0f * (float)j / (float)D);
+
+    for (uint32_t t = 0; t < T; t++) {
+        const float pos = (float)(pos_offset + t);
+        const float* xr = X.ptr() + (size_t)t * X.cols();
+        float* yr = &Y[(size_t)t * Y.cols()];
+        for (uint32_t h = 0; h < n_heads; h++, xr += D, yr += D) {
+            for (uint32_t j = 0; j < half; j++) {
+                const float ang = pos * inv_freq[j];
+                const float c = std::cos(ang), s = std::sin(ang);
+                const float a = xr[j], b = xr[j + half];
+                yr[j]         = a * c - b * s;
+                yr[j + half] = b * c + a * s;
+            }
+        }
+    }
+    return Y;
+}
+
+// Scaled dot-product attention over explicit (T, H, Dh) tensors.
+Tensor sdpa(const Tensor& Q, const Tensor& K, const Tensor& V, bool causal)
+{
+    // Tq may differ from Tk (cache decode attends L keys with one query);
+    // heads and head dims must match.
+    assert(Q.shape.size() == 3 && K.shape.size() == 3 && V.shape.size() == 3);
+    const uint32_t Tq = Q.shape[0], Tk = K.shape[0];
+    const uint32_t H = Q.shape[1], Dh = Q.shape[2];
+    assert(K.shape[1] == H && K.shape[2] == Dh);
+    assert(V.shape[1] == H && V.shape[2] == Dh);
+    assert(!causal || Tq <= Tk);   // causal row i maps to key i
+
+    Tensor out({Tq, H, Dh});
+    const float scale = 1.0f / std::sqrt((float)Dh);
+
+    std::vector<float> scores(Tk);              // one query row at a time
+    for (uint32_t h = 0; h < H; h++) {
+        for (uint32_t qi = 0; qi < Tq; qi++) {
+            const float* q = Q.ptr() + ((size_t)qi * H + h) * Dh;
+            // logits for every key this query may see
+            uint32_t visible = causal ? (qi < Tk ? qi + 1 : Tk) : Tk;
+            float m = -INFINITY;
+            for (uint32_t ki = 0; ki < visible; ki++) {
+                const float* k = K.ptr() + ((size_t)ki * H + h) * Dh;
+                float s = 0;
+                for (uint32_t d = 0; d < Dh; d++) s += q[d] * k[d];
+                s *= scale;
+                scores[ki] = s;
+                if (s > m) m = s;
+            }
+            // stable softmax over the visible keys only
+            float z = 0;
+            for (uint32_t ki = 0; ki < visible; ki++) {
+                scores[ki] = std::exp(scores[ki] - m);
+                z += scores[ki];
+            }
+            float* o = &out[((size_t)qi * H + h) * Dh];
+            for (uint32_t d = 0; d < Dh; d++) o[d] = 0;
+            for (uint32_t ki = 0; ki < visible; ki++) {
+                const float p = scores[ki] / z;
+                const float* v = V.ptr() + ((size_t)ki * H + h) * Dh;
+                for (uint32_t d = 0; d < Dh; d++) o[d] += p * v[d];
+            }
+        }
+    }
+    return out;
+}
+
+void KVCache::init(uint32_t heads, uint32_t dim, uint32_t cap)
+{
+    n_heads = heads; head_dim = dim; capacity = cap; len = 0;
+    k.assign((size_t)cap * heads * dim, 0.f);
+    v = k;
+}
+
+void KVCache::append(const Tensor& Kt, const Tensor& Vt)
+{
+    // one token: (1, H, Dh)
+    assert(Kt.shape.size() == 3 && Kt.shape[0] == 1);
+    assert(Kt.shape[1] == n_heads && Kt.shape[2] == head_dim);
+    assert(Vt.shape == Kt.shape);
+    assert(len < capacity);
+    std::memcpy(&k[(size_t)len * n_heads * head_dim], Kt.ptr(),
+                (size_t)n_heads * head_dim * sizeof(float));
+    std::memcpy(&v[(size_t)len * n_heads * head_dim], Vt.ptr(),
+                (size_t)n_heads * head_dim * sizeof(float));
+    len++;
+}
+
+Tensor KVCache::K() const
+{
+    Tensor out({len, n_heads, head_dim});
+    std::memcpy(out.ptr(), k.data(), (size_t)len * n_heads * head_dim * sizeof(float));
+    return out;
+}
+
+Tensor KVCache::V() const
+{
+    Tensor out({len, n_heads, head_dim});
+    std::memcpy(out.ptr(), v.data(), (size_t)len * n_heads * head_dim * sizeof(float));
+    return out;
+}
+
+// silu(x) = x * sigmoid(x)
+static inline float silu_scalar(float x)
+{
+    return x / (1.0f + std::exp(-x));
+}
+
+Tensor swiglu(const Tensor& gate, const Tensor& up)
+{
+    assert(gate.shape == up.shape);
+    Tensor Y(gate.shape);
+    for (size_t i = 0; i < gate.numel(); i++)
+        Y[i] = silu_scalar(gate[i]) * up[i];
+    return Y;
+}
+
+/* ---- quantization --------------------------------------------------------*/
+
+QLinearInt8 QLinearInt8::from_linear(const Linear& L)
+{
+    QLinearInt8 q;
+    q.out_features = L.W.rows();
+    q.in_features  = L.W.cols();
+    q.b            = L.b;      // bias stays fp32, added exactly
+    q.w.resize((size_t)q.out_features * q.in_features);
+    q.scales.resize(q.out_features);
+
+    for (uint32_t r = 0; r < q.out_features; r++) {
+        const float* row = L.W.ptr() + (size_t)r * q.in_features;
+        float amax = 0;
+        for (uint32_t c = 0; c < q.in_features; c++)
+            amax = std::fmax(amax, std::fabs(row[c]));
+        const float scale = amax / 127.0f;
+        q.scales[r] = scale;
+        int8_t* qr = &q.w[(size_t)r * q.in_features];
+        for (uint32_t c = 0; c < q.in_features; c++) {
+            float v = scale != 0 ? std::nearbyint(row[c] / scale) : 0.f;
+            if (v > 127) v = 127;
+            if (v < -127) v = -127;   // keep symmetric range
+            qr[c] = (int8_t)v;
+        }
+    }
+    return q;
+}
+
+Tensor QLinearInt8::forward(const Tensor& X) const
+{
+    const uint32_t M = X.rows();
+    Tensor Y({M, out_features});
+    for (uint32_t i = 0; i < M; i++) {
+        const float* xr = X.ptr() + (size_t)i * in_features;
+        for (uint32_t r = 0; r < out_features; r++) {
+            const int8_t* wr = &w[(size_t)r * in_features];
+            // weight-only quantization: activations stay fp32, each int8
+            // weight is dequantized on the fly, accumulation in fp32.
+            float acc = 0;
+            for (uint32_t c = 0; c < in_features; c++)
+                acc += xr[c] * (float)wr[c];
+            Y[(size_t)i * out_features + r] =
+                acc * scales[r] + b[r];          // fp32 bias applied exactly
+        }
+    }
+    return Y;
+}
+
+/* ---- sampling -------------------------------------------------------------*/
+
+uint32_t Sampler::sample(const Tensor& logits) const
+{
+    if (!rng_ready_) {
+        rng_.seed(seed);
+        rng_ready_ = true;      // lazily seeded once per Sampler instance
+    }
+
+    const uint32_t V = (uint32_t)logits.data.size();
+    std::vector<float> p(logits.data.begin(), logits.data.end());
+
+    if (temperature > 0.f)
+        for (auto& x : p) x /= temperature;
+
+    // top-k: keep only the k largest logits
+    if (top_k > 0 && top_k < V) {
+        std::vector<uint32_t> idx(V);
+        for (uint32_t i = 0; i < V; i++) idx[i] = i;
+        std::nth_element(idx.begin(), idx.begin() + top_k - 1, idx.end(),
+                         [&](uint32_t a, uint32_t b) { return p[a] > p[b]; });
+        const float cutoff = p[idx[top_k - 1]];
+        for (uint32_t i = 0; i < V; i++)
+            if (p[i] < cutoff) p[i] = -INFINITY;
+    }
+
+    // top-p: smallest prefix of sorted probs with mass >= top_p
+    if (top_p < 1.0f) {
+        std::vector<float> sorted(p);
+        std::sort(sorted.begin(), sorted.end(), std::greater<float>());
+        float sum = 0;
+        for (float x : sorted) sum += x;
+        float csum = 0;
+        uint32_t kept = 0;
+        for (; kept < V; kept++) {
+            csum += sorted[kept];
+            if (csum >= top_p * sum) break;
+        }
+        const float cutoff = sorted[kept];
+        for (uint32_t i = 0; i < V; i++)
+            if (p[i] < cutoff) p[i] = -INFINITY;
+    }
+
+    if (temperature <= 0.f) {                 // greedy over survivors
+        uint32_t best = 0;
+        for (uint32_t i = 1; i < V; i++)
+            if (p[i] > p[best]) best = i;
+        return best;
+    }
+
+    // softmax over survivors, inverse-CDF draw
+    float m = -INFINITY;
+    for (float x : p) m = std::fmax(m, x);
+    float z = 0;
+    for (auto& x : p) {
+        x = (x == -INFINITY) ? 0.f : std::exp(x - m);
+        z += x;
+    }
+    std::uniform_real_distribution<float> u(0.f, 1.f);
+    const float r = u(rng_) * z;
+    float c = 0;
+    for (uint32_t i = 0; i < V; i++) {
+        c += p[i];
+        if (r <= c || i == V - 1) return i;
+    }
+    return V - 1;
+}
+
 }  // namespace ti
