@@ -1,11 +1,23 @@
 # tinyinfer-cpu — a minimal C++17 LLM inference core
 
+[![ci](https://github.com/Panzerkampfwagen-del/tiny-infer/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/Panzerkampfwagen-del/tiny-infer/actions/workflows/ci.yml)
+
 Row-major float32 tensors, validated matmul kernels, fused linear layers,
 a Llama-2-style transformer forward pass, real tokenizer-driven text
 generation, lossless prompt-lookup speculative decoding, and continuous
 batching — every kernel checked against a trivially-correct reference before
 any benchmarking is believed. CPU-only, OpenMP-parallel where it wins,
 honest about where it doesn't.
+
+## Results (RTX-3050-class laptop CPU, 12 threads — `make bench`, `make bench-batch`)
+
+| Claim | Number | Proof |
+|---|---|---|
+| Tiled+OpenMP matmul | **24.9 GF/s vs 6.2 naive** at N=1024 (4.0×) | `make bench` |
+| Grain-size honesty | only **17% of calibrated peak** at N=256 — parallelizing tiny GEMMs loses | `make bench` |
+| INT8 weight-only runtime | **4× smaller weights** (1024 KB vs 4096 KB), 0.7% RMS error | `make bench` |
+| Speculative decoding | **lossless**: identical tokens to greedy, several committed per verification forward | `make test-model` |
+| Continuous batching | **correctness-neutral**: batched == serial token-for-token; ~1.0× goodput (the CPU win would need cross-sequence GEMM stacking — future work) | `make test-model`, `bench-batch 16` |
 
 ## Layout
 
