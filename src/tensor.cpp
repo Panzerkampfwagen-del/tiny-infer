@@ -154,8 +154,17 @@ Tensor rmsnorm_lastdim(const Tensor& X, const Tensor* weight)
 
 Tensor Linear::forward(const Tensor& X) const
 {
-    // X: (batch, in) ; W: (out, in) row-major => logits = X @ W^T + b
-    assert(X.cols() == W.cols());
+    // X: (batch, in) ; W: (out, in) row-major => Y = X @ W^T + b
+    if (X.cols() != W.cols())
+        throw std::runtime_error("Linear::forward: input width " +
+                                 std::to_string(X.cols()) +
+                                 " != weight input width " +
+                                 std::to_string(W.cols()));
+    if (b.data.size() != W.rows())
+        throw std::runtime_error("Linear::forward: bias size " +
+                                 std::to_string(b.data.size()) +
+                                 " != output width " +
+                                 std::to_string(W.rows()));
     const uint32_t batch = X.rows(), in = W.cols(), out = W.rows();
     const float*   bias  = b.data.data();
     Tensor Y({batch, out});

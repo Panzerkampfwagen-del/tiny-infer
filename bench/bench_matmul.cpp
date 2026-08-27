@@ -1,6 +1,11 @@
 /*
- * bench_matmul -- naive vs tiled GFLOP/s, plus end-to-end model throughput.
- * naive is single-threaded; tiled uses OpenMP (row-parallel). Numbers are
+ * bench_matmul -- naive vs tiled GFLOP/s with roofline context, plus
+ * end-to-end model throughput and an int8 comparison.
+ *
+ * Roofline method: peak FLOP/s is calibrated from the best tiled measurement
+ * at the largest N; each row's arithmetic intensity is AI = 2MNK / bytes,
+ * and "% of cal. peak" is measured/peak -- so small-N rows can be seen to be
+ * launch/grain-bound rather than bandwidth- or compute-bound. Numbers are
  * whatever this machine is at run time -- reproduce with `make bench`.
  */
 #include "../include/tensor.hpp"
@@ -8,6 +13,7 @@
 #include <chrono>
 #include <cstdio>
 #include <random>
+#include <vector>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -30,7 +36,12 @@ int main(void)
 #ifdef _OPENMP
     printf("OpenMP threads: %d\n", omp_get_max_threads());
 #endif
-    printf("%8s %10s %12s %12s\n", "N", "reps", "naive GF/s", "tiled GF/s");
+    printf("%8s %10s %12s %12s %12s %14s\n",
+           "N", "reps", "naive GF/s", "tiled GF/s", "AI FLOP/B",
+           "% cal. peak");
+    double peak = 0;                       // calibrated below (largest N tiled)
+    struct Row { uint32_t N; int reps; double naive, tiled, ai; };
+    std::vector<Row> rows;
     for (uint32_t N : {256u, 512u, 1024u}) {
         Tensor A({N, N}), B({N, N});
         for (size_t i = 0; i < A.numel(); i++) A[i] = dist(rng);
@@ -49,9 +60,16 @@ int main(void)
         for (int r = 0; r < reps; r++) { Tensor C = matmul_tiled(A, B); sink2 += C[0]; }
         double t_tiled = now_ms() - t0;
 
-        printf("%8u %10d %12.2f %12.2f\n", N, reps,
-               reps * flops / (t_naive * 1e6), reps * flops / (t_tiled * 1e6));
+        const double g_naive = reps * flops / (t_naive * 1e6);
+        const double g_tiled = reps * flops / (t_tiled * 1e6);
+        // arithmetic intensity: 2 MNK FLOPs over (3 * N^2 * 4 bytes) traffic
+        const double ai = flops / (3.0 * N * N * sizeof(float));
+        rows.push_back({N, reps, g_naive, g_tiled, ai});
+        if (g_tiled > peak) peak = g_tiled;
     }
+    for (const Row& r : rows)
+        printf("%8u %10d %12.2f %12.2f %12.1f %13.1f%%\n",
+               r.N, r.reps, r.naive, r.tiled, r.ai, r.tiled / peak * 100.0);
 
     // model throughput
     MLP m = MLP::random_init(512, 2048, 1000, 9);
