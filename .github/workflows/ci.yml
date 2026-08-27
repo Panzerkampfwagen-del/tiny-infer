@@ -2,8 +2,9 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [master, main]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   build-test:
@@ -11,10 +12,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain
-        run: sudo apt-get update && sudo apt-get install -y g++ python3-dev
-      - name: Build
-        run: make all
-      - name: Correctness suite (kernels + transformer + batching)
+        run: sudo apt-get update && sudo apt-get install -y g++
+      - name: Build (all binaries)
+        run: make -j2 all
+      - name: Kernel correctness suite (37 checks)
+        run: ./build/test_infer
+      - name: System suite (transformer / tokenizer / spec-decode / batching)
+        run: ./build/test_model
+      - name: Benchmark smoke (roofline table + batching goodput)
         run: |
-          ./build/test_infer
-          ./build/test_model
+          ./build/bench_matmul
+          ./build/bench_batch 4
